@@ -33,41 +33,124 @@ const FIELDS    = ["prev","received","sales","closing"];
 const FIELD_LBL = { prev:"পূর্বের মজুদ(লিঃ)", received:"ডিপো হতে গ্রহণ (লিঃ)", sales:"বিক্রয়(লিঃ)", closing:"সমাপনী মজুদ(লিঃ)" };
 
 /* ══ Storage ══ */
-/* ══ Cloud Storage (JSONBin.io — syncs across all browsers) ══
+/* ══ Cloud Storage (JSONBin.io — মাস ভিত্তিক আলাদা bin, registry pattern) ══
    HOW TO SETUP:
    1. Go to https://jsonbin.io → Sign up free
    2. Create a new bin with content: {}
    3. Copy the Bin ID and your Master Key
    4. Replace the values below:
+
+   এই বিনটি (JSONBIN_BIN_ID) এখন থেকে "রেজিস্ট্রি" — শুধু
+   { "months": { "2026-06": "<binId>", "2026-07": "<binId>", ... } }
+   ধরনের একটা ছোট ম্যাপিং রাখে। প্রতি মাসের আসল ডেটা থাকে আলাদা আলাদা ছোট bin-এ,
+   ফলে কোনো একটা bin কখনো বড় হয়ে সাইজ-লিমিটে আটকায় না।
+
+   প্রথমবার এই কোড চালানোর সময়, যদি এই বিনে পুরনো ফরম্যাটের ডেটা
+   (যেমন { "2026-06-01": [...], "2026-06-09": [...] }) পাওয়া যায়,
+   সেটা স্বয়ংক্রিয়ভাবে মাস অনুযায়ী আলাদা bin-এ ভাগ করে মাইগ্রেট করা হবে —
+   পুরনো কোনো তারিখের তথ্য হারাবে না।
 ══════════════════════════════════════════════════════════════ */
 const JSONBIN_MASTER_KEY = "$2a$10$6mzcIScdz0Uiz6jyfLlwfuuiORj6w/tmJmtW5eJ2iVLKfoq9Hz1ea";
-const JSONBIN_BIN_ID     = "69ee27da36566621a8f32dda";
+const JSONBIN_BIN_ID     = "69ee27da36566621a8f32dda"; // রেজিস্ট্রি বিন
 
 const _getKey   = () => localStorage.getItem("fuel_mk")   || JSONBIN_MASTER_KEY;
 const _getBinId = () => localStorage.getItem("fuel_binid") || JSONBIN_BIN_ID;
 
-const loadAll = async () => {
-  const key = _getKey(); const binId = _getBinId();
-  if (!key || !binId) return {};
-  try {
-    const res = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
-      headers: { "X-Master-Key": key, "X-Bin-Meta": "false" }
-    });
-    if (!res.ok) return {};
-    return await res.json();
-  } catch { return {}; }
+const monthKey = (d) => d.slice(0,7); // "YYYY-MM"
+const _hdr = (key) => ({ "Content-Type":"application/json", "X-Master-Key": key });
+
+const _readBin = async (binId, key) => {
+  const res = await fetch(`https://api.jsonbin.io/v3/b/${binId}/latest`, {
+    headers: { "X-Master-Key": key, "X-Bin-Meta": "false" }
+  });
+  if (!res.ok) throw new Error("HTTP "+res.status);
+  return await res.json();
 };
 
-const saveAll = async (d) => {
-  const key = _getKey(); const binId = _getBinId();
-  if (!key || !binId) return;
+const _writeBin = (binId, key, data) =>
+  fetch(`https://api.jsonbin.io/v3/b/${binId}`, {
+    method: "PUT", headers: _hdr(key), body: JSON.stringify(data)
+  });
+
+const _createBin = async (key, name, data) => {
+  const res = await fetch("https://api.jsonbin.io/v3/b", {
+    method: "POST",
+    headers: { ..._hdr(key), "X-Bin-Name": name },
+    body: JSON.stringify(data)
+  });
+  if (!res.ok) throw new Error("HTTP "+res.status);
+  const j = await res.json();
+  return j.metadata.id;
+};
+
+/* রেজিস্ট্রি বিন থেকে মাস-ভিত্তিক bin ম্যাপিং পড়ে, প্রতিটা মাসের bin লোড করে
+   একসাথে মার্জ করে রিটার্ন করে। পুরনো ফরম্যাট পেলে অটো-মাইগ্রেট করে। */
+const loadAll = async () => {
+  const key = _getKey(); const regBinId = _getBinId();
+  if (!key || !regBinId) return {};
+
+  let reg;
+  try { reg = await _readBin(regBinId, key); } catch(e) {
+    console.error("registry load failed:", e); return {};
+  }
+
+  // নতুন ফরম্যাট (রেজিস্ট্রি) — সরাসরি প্রতিটা মাসের bin লোড করো
+  if (reg && typeof reg==="object" && reg.months && typeof reg.months==="object") {
+    let all = {};
+    for (const mk of Object.keys(reg.months)) {
+      try { all = { ...all, ...(await _readBin(reg.months[mk], key)) }; }
+      catch(e){ console.error("month bin load failed:", mk, e); }
+    }
+    return all;
+  }
+
+  // পুরনো ফরম্যাট: { "2026-06-01": [...], ... } → মাস অনুযায়ী ভাগ করে মাইগ্রেট করো
+  const oldData = (reg && typeof reg==="object") ? reg : {};
+  const dateKeys = Object.keys(oldData).filter(k=>/^\d{4}-\d{2}-\d{2}$/.test(k));
+  if (dateKeys.length > 0) {
+    const byMonth = {};
+    dateKeys.forEach(d => { (byMonth[monthKey(d)] ??= {})[d] = oldData[d]; });
+    const months = {};
+    let ok = true;
+    for (const mk of Object.keys(byMonth)) {
+      try { months[mk] = await _createBin(key, `fuel_${mk}`, byMonth[mk]); }
+      catch(e){ console.error("migration bin create failed:", mk, e); ok=false; }
+    }
+    if (ok) {
+      try {
+        const res = await _writeBin(regBinId, key, { months });
+        if (!res.ok) console.error("registry write failed:", res.status);
+      } catch(e){ console.error("registry write failed:", e); }
+    }
+  }
+  return oldData;
+};
+
+/* শুধু changedDate যে মাসে পড়ে, সেই মাসের bin-টাই সেভ করে (না থাকলে নতুন বানায়) */
+const saveAll = async (allData, changedDate) => {
+  const key = _getKey(); const regBinId = _getBinId();
+  if (!key || !regBinId) return;
+  const mk = monthKey(changedDate);
+
+  let reg;
+  try { reg = await _readBin(regBinId, key); } catch(e) {
+    alert("সংরক্ষণ ব্যর্থ! রেজিস্ট্রি পড়া যায়নি: "+e.message); return;
+  }
+  const months = (reg && reg.months && typeof reg.months==="object") ? {...reg.months} : {};
+
+  const monthData = {};
+  Object.keys(allData).forEach(d => { if (monthKey(d)===mk) monthData[d]=allData[d]; });
+
   try {
-    await fetch(`https://api.jsonbin.io/v3/b/${binId}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", "X-Master-Key": key },
-      body: JSON.stringify(d)
-    });
-  } catch(e) { console.error("save failed:", e); }
+    if (!months[mk]) {
+      months[mk] = await _createBin(key, `fuel_${mk}`, monthData);
+      const res = await _writeBin(regBinId, key, { months });
+      if (!res.ok) alert("সংরক্ষণ ব্যর্থ! রেজিস্ট্রি Status: "+res.status);
+    } else {
+      const res = await _writeBin(months[mk], key, monthData);
+      if (!res.ok) alert("সংরক্ষণ ব্যর্থ! Status: "+res.status);
+    }
+  } catch(e) { console.error("save failed:", e); alert("সংরক্ষণ ব্যর্থ: "+e.message); }
 };
 
 /* ══ Helpers ══ */
@@ -484,7 +567,7 @@ export default function App() {
   const handleSave = async () => {
     const updated = {...allData, [selDate]: rows};
     setAllData(updated);
-    await saveAll(updated);
+    await saveAll(updated, selDate);
     flash("✓ সংরক্ষিত হয়েছে!");
   };
 
@@ -500,7 +583,7 @@ export default function App() {
   const deleteDate = async (d) => {
     if (!window.confirm("এই তারিখের তথ্য মুছে ফেলবেন?")) return;
     const u = {...allData}; delete u[d];
-    setAllData(u); await saveAll(u);
+    setAllData(u); await saveAll(u, d);
     if (histDate===d) { setHistDate(""); setHistRows(null); }
   };
 
